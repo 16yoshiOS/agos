@@ -10,8 +10,6 @@
 #  Targets
 #    make            build + verify build/kernel.elf
 #    make iso        build the bootable ISO  -> build/agos.iso
-#    make run        boot the ISO in QEMU (serial log on this terminal)
-#    make run-kernel boot kernel.elf directly in QEMU (no GRUB; text fallback)
 #    make test       run the host-side unit tests
 #    make size       section sizes
 #    make clean
@@ -19,7 +17,6 @@
 #  Packages (Debian/Ubuntu):
 #    build the kernel:  nasm gcc binutils make python3
 #    build the ISO:     grub-pc-bin grub-common xorriso mtools
-#    run:               qemu-system-x86
 # =============================================================================
 
 AS      := nasm
@@ -27,7 +24,6 @@ CC      := gcc
 LD      := ld
 HOSTCC  := gcc
 PYTHON  := python3
-QEMU    := qemu-system-i386
 GRUB_MKRESCUE ?= grub-mkrescue
 
 BUILD      := build
@@ -71,7 +67,7 @@ LDFLAGS := -m elf_i386 -nostdlib -z max-page-size=0x1000 -z noexecstack \
            $(LD_NO_RWX_WARN) -T $(LINKER_LD)
 
 # =============================================================================
-.PHONY: all iso run run-kernel test size check clean
+.PHONY: all iso test size check clean
 
 all: check
 
@@ -110,14 +106,6 @@ $(ISO): $(KERNEL_ELF) boot/grub/grub.cfg
 	cp boot/grub/grub.cfg $(ISO_DIR)/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $@ $(ISO_DIR)
 	@echo "  ISO     $@ ($$(stat -c %s $@) bytes)"
-
-# --- Run (QEMU) ----------------------------------------------------------------
-run: $(ISO)
-	$(QEMU) -cdrom $(ISO) -m 128 -serial stdio
-
-# QEMU's built-in Multiboot loader: no GRUB, no framebuffer (VGA text fallback).
-run-kernel: $(KERNEL_ELF)
-	$(QEMU) -kernel $(KERNEL_ELF) -m 128 -serial stdio
 
 # --- Host-side unit tests --------------------------------------------------------
 # Pure logic (lib, GDT/IDT encoders, scancode decoder, PIT divisor) is compiled
