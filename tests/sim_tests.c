@@ -13,39 +13,10 @@
 
 #include "isr.h"
 #include "keyboard.h"
+#include "mouse.h"
 #include "pic.h"
 #include "pit.h"
-
-/* --- Fake I/O model --------------------------------------------------------- */
-struct io_write io_log[IO_LOG_MAX];
-int             io_log_n;
-uint8_t         fake_isr_master, fake_isr_slave;
-uint8_t         fake_kbd_bytes[256];
-int             fake_kbd_count, fake_kbd_pos;
-static uint8_t  mask_master = 0xFF, mask_slave = 0xFF;   /* last value on 0x21/0xA1 */
-
-void outb(uint16_t port, uint8_t value)
-{
-    if (port == 0x80)
-        return;
-    if (io_log_n < IO_LOG_MAX)
-        io_log[io_log_n++] = (struct io_write){ port, value };
-    if (port == 0x21) mask_master = value;
-    if (port == 0xA1) mask_slave  = value;
-}
-
-uint8_t inb(uint16_t port)
-{
-    switch (port) {
-    case 0x60: return fake_kbd_pos < fake_kbd_count ? fake_kbd_bytes[fake_kbd_pos++] : 0;
-    case 0x64: return fake_kbd_pos < fake_kbd_count ? 0x01 : 0x00;
-    case 0x21: return mask_master;
-    case 0xA1: return mask_slave;
-    case 0x20: return fake_isr_master;
-    case 0xA0: return fake_isr_slave;
-    default:   return 0;
-    }
-}
+#include "ps2.h"
 
 /* --- Stub for the panic path (panic.c needs graphics; not under test) --------
  * The real function is noreturn, so the stub must not return either: it jumps
@@ -98,7 +69,11 @@ static void irq(unsigned n)
     isr_dispatch(&r);
 }
 
-static void kbd_push(uint8_t b) { fake_kbd_bytes[fake_kbd_count++] = b; }
+static void kbd_push(uint8_t b) { fake_kbd_bytes[fake_kbd_count] = b; fake_kbd_aux[fake_kbd_count++] = 0; }
+static void aux_push(uint8_t b) { fake_kbd_bytes[fake_kbd_count] = b; fake_kbd_aux[fake_kbd_count++] = 1; }
+
+/* The real ps2.c installs this for IRQ1/IRQ12; ps2_init() itself needs a device. */
+static void ps2_irq_for_test(struct regs *r) { (void)r; ps2_service(); }
 
 /* --- Tests -------------------------------------------------------------------- */
 static void test_pic_remap(void)
@@ -119,10 +94,10 @@ static void test_pic_remap(void)
 
     /* unmasking a slave IRQ must also open the cascade line (IRQ2) */
     pic_clear_mask(9);
-    CHECK(mask_slave == 0xFD);          /* bit 1 cleared                        */
-    CHECK(!(mask_master & 0x04));       /* cascade open                         */
+    CHECK(fake_mask_slave == 0xFD);          /* bit 1 cleared                        */
+    CHECK(!(fake_mask_master & 0x04));       /* cascade open                         */
     pic_set_mask(9);
-    CHECK(mask_slave == 0xFF);
+    CHECK(fake_mask_slave == 0xFF);
 }
 
 static void test_pit(void)
@@ -132,11 +107,11 @@ static void test_pit(void)
     log_reset();
     pit_init(100);
 
-    /* channel 0, lobyte/hibyte, mode 3, binary; divisor 11932 = 0x2E9C */
-    CHECK(io_log[0].port == 0x43 && io_log[0].val == 0x36);
+    /* channel 0, lobyte/hibyte, mode 2 (rate generator), binary; divisor 11932 = 0x2E9C */
+    CHECK(io_log[0].port == 0x43 && io_log[0].val == 0x34);
     CHECK(io_log[1].port == 0x40 && io_log[1].val == 0x9C);
     CHECK(io_log[2].port == 0x40 && io_log[2].val == 0x2E);
-    CHECK(!(mask_master & 0x01));       /* IRQ0 unmasked                        */
+    CHECK(!(fake_mask_master & 0x01));       /* IRQ0 unmasked                        */
     CHECK(pit_hz() == 100 && pit_ticks() == 0 && pit_uptime_ms() == 0);
 
     log_reset();
@@ -159,10 +134,10 @@ static void test_keyboard(void)
 
     pic_remap(0x20, 0x28);
     fake_kbd_count = fake_kbd_pos = 0;
-    kbd_push(0x55);                     /* stale byte left by firmware          */
     kbd_init();
-    CHECK(fake_kbd_pos == fake_kbd_count);          /* init drained it          */
-    CHECK(!(mask_master & 0x02));                   /* IRQ1 unmasked            */
+    isr_register_handler(IRQ_VECTOR(1), ps2_irq_for_test);
+    pic_clear_mask(1);
+    CHECK(!(fake_mask_master & 0x02));              /* IRQ1 unmasked            */
     CHECK(kbd_poll(&ev) == 0);
 
     /* press and release 'a' */
@@ -294,11 +269,76 @@ static void test_exceptions(void)
     isr_register_handler(48, h);
 }
 
+
+static void test_mouse_and_routing(void)
+{
+    struct mouse_event m;
+    struct key_event k;
+
+    pic_remap(0x20, 0x28);
+    kbd_init();
+    mouse_setup(0);
+    isr_register_handler(IRQ_VECTOR(1), ps2_irq_for_test);
+    isr_register_handler(IRQ_VECTOR(12), ps2_irq_for_test);
+    pic_clear_mask(12);
+    CHECK(!(fake_mask_slave & 0x10));                /* IRQ12 = slave bit 4      */
+    CHECK(!(fake_mask_master & 0x04));               /* cascade opened           */
+
+    /* A key press arrives in the middle of a mouse packet: the controller's
+     * AUX status bit routes every byte to the right decoder. */
+    fake_kbd_count = fake_kbd_pos = 0;
+    aux_push(0x29);                                  /* sync | L button | Y negative */
+    kbd_push(0x1E);                                  /* 'a' make code            */
+    aux_push(5);                                     /* dx = +5                  */
+    aux_push(0xFE);                                  /* dy = -2 (PS/2 Y is up)   */
+    log_reset();
+    irq(12);                                         /* one IRQ drains the buffer */
+    CHECK(fake_kbd_pos == fake_kbd_count);
+    CHECK(kbd_poll(&k) && k.keycode == 'a' && k.pressed);
+    CHECK(mouse_poll(&m) && m.dx == 5 && m.dy == 2 && m.buttons == 1);   /* Y flipped */
+    CHECK(mouse_poll(&m) == 0);
+    CHECK(log_has(0xA0, 0x20) && log_has(0x20, 0x20));   /* slave + master EOI    */
+
+    /* wheel mouse: 4-byte packets */
+    mouse_setup(3);
+    fake_kbd_count = fake_kbd_pos = 0;
+    aux_push(0x08); aux_push(0); aux_push(0); aux_push(0xFF);   /* wheel -1      */
+    irq(12);
+    CHECK(mouse_poll(&m) && m.wheel == -1 && m.dx == 0);
+}
+
+static void test_clock(void)
+{
+    uint32_t a, b;
+
+    pic_remap(0x20, 0x28);
+    pit_init(100);                                   /* divisor 11932             */
+    fake_pit_count = 11932;                          /* counter just reloaded     */
+    a = pit_clock_us();
+    fake_pit_count = 11932 / 2;                      /* halfway through the tick  */
+    b = pit_clock_us();
+    CHECK(b - a > 4900 && b - a < 5100);             /* ~5 ms                     */
+
+    irq(0);                                          /* next tick                 */
+    fake_pit_count = 11932;
+    a = pit_clock_us();
+    CHECK(a - b > 4900 && a - b < 5200);             /* half tick + epsilon       */
+
+    /* counter wrapped but the IRQ has not run yet: the clock must not go back */
+    fake_pit_count = 100;
+    b = pit_clock_us();
+    fake_pit_count = 11900;                          /* wrapped around            */
+    a = pit_clock_us();
+    CHECK((int32_t)(a - b) >= 0);
+}
+
 int main(void)
 {
     test_pic_remap();
     test_pit();
     test_keyboard();
+    test_mouse_and_routing();
+    test_clock();
     test_eoi_and_spurious();
     test_exceptions();
 

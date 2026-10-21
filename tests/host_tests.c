@@ -15,6 +15,7 @@
 #include "isr.h"
 #include "kbd_decode.h"
 #include "lib.h"
+#include "mouse_decode.h"
 #include "pit.h"
 
 /* --- Stubs for symbols that normally come from assembly -------------------- */
@@ -294,6 +295,89 @@ static void dump_font(void)
     }
 }
 
+
+/* --- ksnprintf / string helpers ---------------------------------------------------- */
+static void test_format(void)
+{
+    char b[64];
+
+    CHECK(ksnprintf(b, sizeof(b), "%d MB free of %d MB", 72, 256) == 20 && !strcmp(b, "72 MB free of 256 MB"));
+    ksnprintf(b, sizeof(b), "%5d|%-5d|%05d|%x|%X|%u", 42, 42, 42, 255, 255, 4000000000u);
+    CHECK(!strcmp(b, "   42|42   |00042|ff|FF|4000000000"));
+    ksnprintf(b, sizeof(b), "%d %d", -7, (int)0x80000000);
+    CHECK(!strcmp(b, "-7 -2147483648"));
+    ksnprintf(b, sizeof(b), "[%s][%10s][%-6s][%.3s][%c][%%]", "ab", "right", "left", "truncated", 'x');
+    CHECK(!strcmp(b, "[ab][     right][left  ][tru][x][%]"));
+    ksnprintf(b, sizeof(b), "%*d|%-*d|%.*s", 6, 12, 4, 7, 2, "hello");
+    CHECK(!strcmp(b, "    12|7   |he"));
+    ksnprintf(b, sizeof(b), "%s", (char *)0);
+    CHECK(!strcmp(b, "(null)"));
+
+    char small[8];                                   /* truncation: terminated, length reported */
+    CHECK(ksnprintf(small, sizeof(small), "%s", "0123456789") == 10);
+    CHECK(!strcmp(small, "0123456"));
+    CHECK(ksnprintf(NULL, 0, "%d", 12345) == 5);
+
+    CHECK(kstrcmp("a", "b") < 0 && kstrcmp("b", "a") > 0 && kstrcmp("x", "x") == 0);
+    CHECK(kstrncmp("abcd", "abzz", 2) == 0 && kstrncmp("abcd", "abzz", 3) != 0);
+    CHECK(kstrcasecmp("HeLLo", "hello") == 0 && kstrncasecmp("HTTP://", "http", 4) == 0);
+    CHECK(kstrchr("hello", 'l') && kstrchr("hello", 'l') - "hello" == 2 && !kstrchr("hello", 'z'));
+    CHECK(kstrstr("hello world", "o w") != NULL && !kstrstr("hello", "xyz"));
+    char c[8];
+    CHECK(kstrlcpy(c, "toolongstring", sizeof(c)) == 13 && !strcmp(c, "toolong"));
+    CHECK(kstrtoul("0x1F", NULL, 0) == 31 && kstrtoul("  123abc", NULL, 10) == 123);
+    const char *end;
+    CHECK(kstrtoul("777z", &end, 8) == 511 && *end == 'z');
+}
+
+/* --- Mouse packet decoder ---------------------------------------------------------- */
+static void test_mouse_decode(void)
+{
+    struct mouse_decoder d;
+    struct mouse_event e;
+
+    mouse_decoder_init(&d, 0);
+    CHECK(!mouse_decoder_feed(&d, 0x09, &e));
+    CHECK(!mouse_decoder_feed(&d, 10, &e));
+    CHECK(mouse_decoder_feed(&d, 3, &e) && e.dx == 10 && e.dy == -3 && e.buttons == 1);
+
+    /* negative deltas via the sign bits (9-bit two's complement) */
+    CHECK(!mouse_decoder_feed(&d, 0x08 | 0x10 | 0x20 | 0x02, &e));
+    CHECK(!mouse_decoder_feed(&d, 0xF6, &e));            /* -10 */
+    CHECK(mouse_decoder_feed(&d, 0xFD, &e) && e.dx == -10 && e.dy == 3 && e.buttons == 2);
+
+    /* a byte without the sync bit is dropped while waiting for a packet start */
+    CHECK(!mouse_decoder_feed(&d, 0x00, &e));
+    CHECK(!mouse_decoder_feed(&d, 0x0C, &e));            /* middle button, sync ok */
+    CHECK(!mouse_decoder_feed(&d, 0, &e));
+    CHECK(mouse_decoder_feed(&d, 0, &e) && e.buttons == 4 && e.dx == 0);
+
+    /* overflow bits: motion discarded, buttons kept */
+    CHECK(!mouse_decoder_feed(&d, 0x08 | 0x40 | 0x01, &e));
+    CHECK(!mouse_decoder_feed(&d, 200, &e));
+    CHECK(mouse_decoder_feed(&d, 100, &e) && e.dx == 0 && e.dy == 0 && e.buttons == 1);
+
+    /* reset drops a half packet */
+    mouse_decoder_feed(&d, 0x09, &e);
+    mouse_decoder_reset(&d);
+    CHECK(!mouse_decoder_feed(&d, 0x08, &e));            /* starts fresh with this one */
+    CHECK(!mouse_decoder_feed(&d, 1, &e));
+    CHECK(mouse_decoder_feed(&d, 1, &e) && e.dx == 1 && e.dy == -1);
+
+    /* IntelliMouse (id 3): 4-byte packets, signed wheel */
+    mouse_decoder_init(&d, 3);
+    mouse_decoder_feed(&d, 0x08, &e); mouse_decoder_feed(&d, 0, &e); mouse_decoder_feed(&d, 0, &e);
+    CHECK(mouse_decoder_feed(&d, 0x01, &e) && e.wheel == 1);
+    mouse_decoder_feed(&d, 0x08, &e); mouse_decoder_feed(&d, 0, &e); mouse_decoder_feed(&d, 0, &e);
+    CHECK(mouse_decoder_feed(&d, 0xFE, &e) && e.wheel == -2);
+
+    /* Explorer (id 4): 4-bit wheel + buttons 4/5 */
+    mouse_decoder_init(&d, 4);
+    mouse_decoder_feed(&d, 0x09, &e); mouse_decoder_feed(&d, 0, &e); mouse_decoder_feed(&d, 0, &e);
+    CHECK(mouse_decoder_feed(&d, 0x10 | 0x0F, &e) && e.wheel == -1 &&
+          (e.buttons & MOUSE_BTN_4) && !(e.buttons & MOUSE_BTN_5) && (e.buttons & MOUSE_BTN_LEFT));
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "--font") == 0) {
@@ -307,6 +391,8 @@ int main(int argc, char **argv)
     test_pit();
     test_keyboard();
     test_font();
+    test_format();
+    test_mouse_decode();
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

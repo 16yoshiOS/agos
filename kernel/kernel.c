@@ -29,6 +29,11 @@
 #include "io.h"
 #include "isr.h"
 #include "keyboard.h"
+#include "acct.h"
+#include "cpu.h"
+#include "heap.h"
+#include "pmm.h"
+#include "ps2.h"
 #include "lib.h"
 #include "multiboot.h"
 #include "panic.h"
@@ -320,7 +325,22 @@ void kernel_main(uint32_t magic, const struct multiboot_info *mbi)
                         serial_puts("pit: ");
                         serial_put_dec(pit_hz());
                         serial_puts(" Hz\n");
-    kbd_init();         serial_puts("kbd: ok\n");
+    {
+        extern uint8_t kernel_end[];
+
+        if (!pmm_init(mbi, (uint32_t)(uintptr_t)kernel_end))
+            kernel_panic("pmm: unusable memory map");
+        heap_init();
+        serial_puts("mm: pmm + heap ready\n");
+    }
+    cpu_detect();
+    serial_puts("cpu: ");
+    serial_puts(cpu_get()->brand);
+    serial_puts("\n");
+
+    ps2_init();
+    serial_puts("ps2: keyboard ok, mouse ");
+    serial_puts(ps2_mouse_present() ? "ok\n" : "not found\n");
 
     ui.total_ram_kb = usable_ram_kb(mbi);
     serial_puts("ram: ");
@@ -328,6 +348,10 @@ void kernel_main(uint32_t magic, const struct multiboot_info *mbi)
     serial_puts(" MB usable\n");
 
     cpu_sti();          serial_puts("interrupts: on\n");
+    cpu_calibrate();
+    serial_puts("cpu: ");
+    serial_put_dec(cpu_get()->mhz);
+    serial_puts(" MHz\n");
 
     if (gfx_init(mbi)) {
         ui.fb_w = gfx_width();
