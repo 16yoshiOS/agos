@@ -13,6 +13,9 @@
  * nothing in the ELF/ISO and GRUB zero-fills it). */
 #define GFX_MAX_PIXELS (1920u * 1080u)
 
+/* Back buffer in .bss: costs nothing in the ELF/ISO and GRUB zero-fills it.
+ * Pixels are stored as host-order XRGB dwords whatever the screen format is,
+ * so a 24-bpp VRAM target (S3 Vision 868) needs no extra RAM copy. */
 static uint32_t backbuffer[GFX_MAX_PIXELS];
 
 static struct {
@@ -20,6 +23,7 @@ static struct {
     uint8_t  *fb;                       /* physical framebuffer               */
     uint32_t  pitch;                    /* bytes per scanline of the screen   */
     int       w, h;
+    uint8_t   bpp;                      /* 24 or 32                           */
     uint8_t   rpos, rsize, gpos, gsize, bpos, bsize;
 } g;
 
@@ -29,7 +33,8 @@ bool gfx_init(const struct multiboot_info *mbi)
 
     if (!(mbi->flags & MBI_FLAG_FRAMEBUF))
         return false;
-    if (mbi->framebuffer_type != MB_FB_TYPE_RGB || mbi->framebuffer_bpp != 32)
+    if (mbi->framebuffer_type != MB_FB_TYPE_RGB ||
+        (mbi->framebuffer_bpp != 32 && mbi->framebuffer_bpp != 24))
         return false;
     if (mbi->framebuffer_addr_hi != 0)  /* above 4 GiB: not addressable here  */
         return false;
@@ -39,7 +44,7 @@ bool gfx_init(const struct multiboot_info *mbi)
 
     if (w == 0 || h == 0 || w > 1920 || h > 1080 || w * h > GFX_MAX_PIXELS)
         return false;
-    if (mbi->framebuffer_pitch < w * 4)
+    if (mbi->framebuffer_pitch < w * (mbi->framebuffer_bpp / 8u))
         return false;
     if (mbi->red_mask_size > 8 || mbi->green_mask_size > 8 || mbi->blue_mask_size > 8)
         return false;
@@ -48,9 +53,34 @@ bool gfx_init(const struct multiboot_info *mbi)
     g.pitch = mbi->framebuffer_pitch;
     g.w     = (int)w;
     g.h     = (int)h;
+    g.bpp   = mbi->framebuffer_bpp;
     g.rpos  = mbi->red_field_position;   g.rsize = mbi->red_mask_size;
     g.gpos  = mbi->green_field_position; g.gsize = mbi->green_mask_size;
     g.bpos  = mbi->blue_field_position;  g.bsize = mbi->blue_mask_size;
+    g.ready = true;
+    return true;
+}
+
+bool gfx_init_lfb(void *fb, int w, int h, uint32_t pitch, int bpp)
+{
+    g.ready = false;
+
+    if (!fb || w <= 0 || h <= 0 || (bpp != 24 && bpp != 32))
+        return false;
+    if (w > 1920 || h > 1080 || (uint32_t)w * (uint32_t)h > GFX_MAX_PIXELS)
+        return false;
+    if (pitch < (uint32_t)w * ((uint32_t)bpp / 8u))
+        return false;
+
+    g.fb    = (uint8_t *)fb;
+    g.pitch = pitch;
+    g.w     = w;
+    g.h     = h;
+    g.bpp   = (uint8_t)bpp;
+    /* Standard little-endian direct-colour layout used by S3 LFB modes. */
+    g.bpos  = 0;  g.bsize = 8;
+    g.gpos  = 8;  g.gsize = 8;
+    g.rpos  = 16; g.rsize = 8;
     g.ready = true;
     return true;
 }
@@ -137,19 +167,39 @@ int gfx_string_width(const char *s, int scale)
     return (int)strlen(s) * FONT_W * scale;
 }
 
+/* Copy the back buffer to the screen.
+ *  - 32 bpp: REP MOVSD straight from the (already packed) back buffer.
+ *  - 24 bpp: convert XRGB -> BGR on the fly, one byte triple per pixel. */
 void gfx_present(void)
 {
     if (!g.ready)
         return;
 
+    if (g.bpp == 32) {
+        for (int row = 0; row < g.h; row++) {
+            const uint32_t *src = &backbuffer[row * g.w];
+            uint32_t       *dst = (uint32_t *)(g.fb + (size_t)row * g.pitch);
+            size_t          n   = (size_t)g.w;
+
+            __asm__ volatile ("cld; rep movsl"
+                              : "+S"(src), "+D"(dst), "+c"(n)
+                              :
+                              : "memory");
+        }
+        return;
+    }
+
+    /* 24 bpp: VRAM holds B,G,R bytes in increasing address order. */
     for (int row = 0; row < g.h; row++) {
         const uint32_t *src = &backbuffer[row * g.w];
-        uint32_t       *dst = (uint32_t *)(g.fb + (size_t)row * g.pitch);
-        size_t          n   = (size_t)g.w;
+        uint8_t        *dst = g.fb + (size_t)row * g.pitch;
 
-        __asm__ volatile ("cld; rep movsl"
-                          : "+S"(src), "+D"(dst), "+c"(n)
-                          :
-                          : "memory");
+        for (int col = 0; col < g.w; col++) {
+            uint32_t px = pack(*src++);
+            dst[0] = (uint8_t)px;
+            dst[1] = (uint8_t)(px >> 8);
+            dst[2] = (uint8_t)(px >> 16);
+            dst += 3;
+        }
     }
 }

@@ -14,6 +14,11 @@
 /* Initialise from the bootloader's framebuffer description. Returns false (and
  * leaves graphics disabled) if there is no usable 32-bpp direct-colour mode. */
 bool gfx_init(const struct multiboot_info *mbi);
+
+/* Adopt an externally initialised linear framebuffer (e.g. the S3 Vision 868
+ * driver, see drivers/s3v.c). bpp must be 32 or 24; pitch is in bytes. */
+bool gfx_init_lfb(void *fb, int w, int h, uint32_t pitch, int bpp);
+
 bool gfx_ready(void);
 
 int  gfx_width(void);
